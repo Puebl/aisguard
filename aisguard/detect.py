@@ -7,6 +7,12 @@ from typing import Optional, List, Dict, Any
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+try:
+    from sklearn.ensemble import IsolationForest
+except Exception:  # pragma: no cover
+    IsolationForest = None
+from .geojson import export_geojson
+from .kml import export_kml
 
 EARTH_R_KM = 6371.0088
 
@@ -29,7 +35,17 @@ class Incident:
     details: Dict[str, Any]
 
 
-def run_detection(inp_csv: Path, out_json: Path, out_plot: Optional[Path], max_speed_knots: float = 45.0, max_jump_km: float = 20.0):
+def run_detection(
+    inp_csv: Path,
+    out_json: Path,
+    out_plot: Optional[Path],
+    out_geojson: Optional[Path] = None,
+    out_kml: Optional[Path] = None,
+    max_speed_knots: float = 45.0,
+    max_jump_km: float = 20.0,
+    use_ml: bool = False,
+    ml_contamination: float = 0.02,
+):
     df = pd.read_csv(inp_csv)
     required = {"mmsi", "lat", "lon", "ts"}
     missing = required - set(df.columns)
@@ -47,12 +63,14 @@ def run_detection(inp_csv: Path, out_json: Path, out_plot: Optional[Path], max_s
     df = df.dropna(subset=["ts"]).sort_values(["mmsi", "ts"])  # sort by time per MMSI
 
     incidents: List[Incident] = []
-    summary = {"total_points": int(len(df)), "mmsi_count": int(df["mmsi"].nunique()), "flags": {"speed_excess": 0, "teleport": 0, "bad_order": 0}}
+    summary = {"total_points": int(len(df)), "mmsi_count": int(df["mmsi"].nunique()), "flags": {"speed_excess": 0, "teleport": 0, "bad_order": 0, "ml_outlier": 0}}
 
     # group by MMSI and scan sequences
     groups = df.groupby("mmsi", sort=False)
     plot_tracks: Dict[int, pd.DataFrame] = {}
 
+    segment_features = []  # collect features per segment for ML
+    seg_index = []  # references to (mmsi, ts_prev, ts_curr)
     for mmsi, g in groups:
         g = g.sort_values("ts").reset_index(drop=True)
         plot_tracks[mmsi] = g
@@ -79,11 +97,53 @@ def run_detection(inp_csv: Path, out_json: Path, out_plot: Optional[Path], max_s
                 incidents.append(Incident(type="speed_excess", mmsi=int(mmsi), ts_prev=prev.ts.isoformat(), ts_curr=curr.ts.isoformat(), details={"speed_kts": round(speed_kts,2), "dist_km": round(dist_km,2), "dt_s": int(dt_s)}))
                 summary["flags"]["speed_excess"] += 1
 
+            # collect features for ML
+            if use_ml:
+                segment_features.append([
+                    dist_km,
+                    dt_s,
+                    speed_kts,
+                    float(curr.lat),
+                    float(curr.lon),
+                ])
+                seg_index.append((int(mmsi), prev.ts.isoformat(), curr.ts.isoformat()))
+
     report = {"input": str(inp_csv), "summary": summary, "incidents": [asdict(x) for x in incidents]}
     out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if out_plot is not None:
         _plot_tracks(plot_tracks, incidents, out_plot)
+
+    # Optional ML anomaly scoring on segments
+    if use_ml and segment_features and IsolationForest is not None:
+        X = np.array(segment_features, dtype=float)
+        try:
+            iso = IsolationForest(contamination=max(0.001, min(0.5, float(ml_contamination))), random_state=42)
+            y = iso.fit_predict(X)  # -1 outlier
+            for flag, (mmsi, ts_prev, ts_curr), feats in zip(y, seg_index, segment_features):
+                if flag == -1:
+                    incidents.append(Incident(
+                        type="ml_outlier",
+                        mmsi=int(mmsi),
+                        ts_prev=ts_prev,
+                        ts_curr=ts_curr,
+                        details={"features": {"dist_km": round(feats[0],2), "dt_s": int(feats[1]), "speed_kts": round(feats[2],2)}}
+                    ))
+                    summary["flags"]["ml_outlier"] += 1
+        except Exception:
+            pass
+
+    # Overwrite JSON to include ML incidents if added
+    report = {"input": str(inp_csv), "summary": summary, "incidents": [asdict(x) for x in incidents]}
+    out_json.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Optional GeoJSON export
+    if out_geojson is not None:
+        export_geojson(plot_tracks, incidents, out_geojson)
+
+    # Optional KML export
+    if out_kml is not None:
+        export_kml(plot_tracks, incidents, out_kml)
 
 
 def _plot_tracks(tracks: Dict[int, pd.DataFrame], incidents: List[Incident], out_path: Path):
